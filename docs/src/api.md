@@ -31,6 +31,8 @@ MethodType
 register!
 services
 service_descriptor
+proto_type_name
+register_proto_type!
 ```
 
 ## Stream Types
@@ -109,6 +111,8 @@ get_metadata
 get_metadata_string
 get_metadata_binary
 remaining_time
+is_expired
+ensure_not_expired
 is_cancelled
 ```
 

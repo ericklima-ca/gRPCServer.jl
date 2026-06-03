@@ -4,6 +4,7 @@
 using Test
 using Dates
 using gRPCServer
+using Sockets
 
 # Include conformance test data
 include("../fixtures/conformance_data.jl")
@@ -220,6 +221,59 @@ using .ConformanceData
     end  # T045
 
     # =========================================================================
+    # T045b: Expired Requests Are Rejected Before Handler Dispatch
+    # =========================================================================
+
+    @testset "T045b: expired request rejected before dispatch" begin
+        handler_calls = Ref(0)
+
+        function expired_request_handler(ctx, request)
+            handler_calls[] += 1
+            return Vector{UInt8}("should not run")
+        end
+
+        server = gRPCServer.GRPCServer("127.0.0.1", 50051)
+        descriptor = gRPCServer.ServiceDescriptor(
+            "test.Timeout",
+            Dict(
+                "Unary" => gRPCServer.MethodDescriptor(
+                    "Unary",
+                    gRPCServer.MethodType.UNARY,
+                    "test.TimeoutRequest",
+                    "test.TimeoutResponse",
+                    expired_request_handler
+                )
+            ),
+            nothing
+        )
+        gRPCServer.register_service!(server.dispatcher, descriptor)
+
+        conn = gRPCServer.HTTP2Connection()
+        conn.state = gRPCServer.ConnectionState.OPEN
+        stream = gRPCServer.create_stream(conn, UInt32(1))
+        stream.request_headers = [
+            (":method", "POST"),
+            (":path", "/test.Timeout/Unary"),
+            (":scheme", "http"),
+            (":authority", "localhost"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+            ("grpc-timeout", "0S"),
+        ]
+        stream.headers_complete = true
+        gRPCServer.receive_headers!(stream, false)
+        gRPCServer.receive_data!(stream, gRPCServer.encode_grpc_message(Vector{UInt8}("request")), true)
+
+        io = IOBuffer()
+        peer = gRPCServer.PeerInfo(Sockets.IPv4("127.0.0.1"), 12345)
+        gRPCServer.process_completed_streams!(server, conn, io, peer)
+
+        @test handler_calls[] == 0
+        @test position(io) > 0
+        @test gRPCServer.get_stream(conn, UInt32(1)) === nothing
+    end
+
+    # =========================================================================
     # T046: Context Cancellation
     # =========================================================================
 
@@ -242,6 +296,12 @@ using .ConformanceData
             gRPCServer.cancel!(ctx)
             @test gRPCServer.is_cancelled(ctx)
             @test gRPCServer.is_cancelled(ctx)  # Still cancelled
+        end
+
+        @testset "Expired context reports expired" begin
+            ctx = gRPCServer.ServerContext(deadline=now() - Second(1))
+            @test gRPCServer.is_expired(ctx)
+            @test_throws gRPCServer.GRPCError gRPCServer.ensure_not_expired(ctx)
         end
 
     end  # T046

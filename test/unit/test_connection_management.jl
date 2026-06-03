@@ -93,6 +93,140 @@ using .ConformanceData
             @test isempty(responses)
         end
 
+        @testset "Server keepalive state tracks PING ACKs" begin
+            state = gRPCServer.KeepaliveState()
+            payload = gRPCServer.make_keepalive_payload()
+
+            @test length(payload) == 8
+            @test !gRPCServer.keepalive_pending(state)
+
+            gRPCServer.mark_keepalive_sent!(state, payload; now=10.0)
+            @test gRPCServer.keepalive_pending(state)
+            @test !gRPCServer.keepalive_timed_out(state, 5.0; now=14.0)
+            @test gRPCServer.keepalive_timed_out(state, 5.0; now=15.0)
+
+            non_ack = PureHTTP2.ping_frame(payload)
+            @test !gRPCServer.process_keepalive_ack!(state, non_ack)
+            @test gRPCServer.keepalive_pending(state)
+
+            wrong_ack = PureHTTP2.ping_frame(reverse(payload); ack=true)
+            @test !gRPCServer.process_keepalive_ack!(state, wrong_ack)
+            @test gRPCServer.keepalive_pending(state)
+
+            ack = PureHTTP2.ping_frame(payload; ack=true)
+            @test gRPCServer.process_keepalive_ack!(state, ack)
+            @test !gRPCServer.keepalive_pending(state)
+            @test !gRPCServer.keepalive_timed_out(state, 0.0; now=20.0)
+        end
+
+        @testset "Server keepalive loop is disabled by default" begin
+            server = gRPCServer.GRPCServer("127.0.0.1", 50051)
+            conn = gRPCServer.HTTP2Connection()
+            io = IOBuffer()
+            state = gRPCServer.KeepaliveState()
+
+            @test gRPCServer.start_keepalive_loop(server, conn, io, state) === nothing
+            @test position(io) == 0
+            @test !gRPCServer.keepalive_pending(state)
+        end
+
+        @testset "Client keepalive policy ignores non-PING and ACK frames" begin
+            config = gRPCServer.ServerConfig()
+            conn = gRPCServer.HTTP2Connection()
+            state = gRPCServer.ClientKeepaliveState()
+
+            settings_ack = PureHTTP2.settings_frame(; ack=true)
+            ping_ack = PureHTTP2.ping_frame(zeros(UInt8, 8); ack=true)
+
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, settings_ack; now=10.0
+            )
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping_ack; now=11.0
+            )
+            @test state.ping_strikes == 0
+            @test state.last_ping_at === nothing
+        end
+
+        @testset "Client PINGs without active streams are enforced" begin
+            config = gRPCServer.ServerConfig()
+            conn = gRPCServer.HTTP2Connection()
+            state = gRPCServer.ClientKeepaliveState()
+            ping = PureHTTP2.ping_frame(zeros(UInt8, 8))
+
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=10.0
+            )
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=20.0
+            )
+            @test gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=30.0
+            )
+            @test state.ping_strikes == 3
+        end
+
+        @testset "Client PINGs obey minimum interval with active streams" begin
+            config = gRPCServer.ServerConfig(
+                permit_keepalive_time = 60.0,
+                permit_keepalive_without_calls = false,
+            )
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = PureHTTP2.ConnectionState.OPEN
+            PureHTTP2.create_stream(conn, UInt32(1))
+            state = gRPCServer.ClientKeepaliveState()
+            ping = PureHTTP2.ping_frame(zeros(UInt8, 8))
+
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=10.0
+            )
+            @test state.ping_strikes == 0
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=20.0
+            )
+            @test state.ping_strikes == 1
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=90.0
+            )
+            @test state.ping_strikes == 0
+        end
+
+        @testset "Client PINGs without calls can be permitted explicitly" begin
+            config = gRPCServer.ServerConfig(
+                permit_keepalive_time = 60.0,
+                permit_keepalive_without_calls = true,
+            )
+            conn = gRPCServer.HTTP2Connection()
+            state = gRPCServer.ClientKeepaliveState()
+            ping = PureHTTP2.ping_frame(zeros(UInt8, 8))
+
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=10.0
+            )
+            @test state.ping_strikes == 0
+            @test !gRPCServer.should_close_for_client_keepalive!(
+                state, config, conn, ping; now=20.0
+            )
+            @test state.ping_strikes == 1
+        end
+
+        @testset "Client keepalive GOAWAY uses too_many_pings" begin
+            conn = gRPCServer.HTTP2Connection()
+            conn.state = PureHTTP2.ConnectionState.OPEN
+            conn.last_client_stream_id = UInt32(7)
+
+            goaway = PureHTTP2.send_goaway(
+                conn,
+                PureHTTP2.ErrorCode.ENHANCE_YOUR_CALM,
+                Vector{UInt8}("too_many_pings"),
+            )
+            last_stream_id, error_code, debug_data = PureHTTP2.parse_goaway_frame(goaway)
+
+            @test last_stream_id == 7
+            @test error_code == PureHTTP2.ErrorCode.ENHANCE_YOUR_CALM
+            @test String(debug_data) == "too_many_pings"
+        end
+
     end  # T038
 
     # =========================================================================

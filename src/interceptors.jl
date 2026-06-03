@@ -247,11 +247,7 @@ function (i::TimeoutInterceptor)(ctx::ServerContext, request, info::MethodInfo, 
         ctx.deadline = now() + Millisecond(i.default_timeout_ms)
     end
 
-    # Check if already expired
-    remaining = remaining_time(ctx)
-    if remaining !== nothing && remaining <= 0
-        throw(GRPCError(StatusCode.DEADLINE_EXCEEDED, "Request deadline exceeded before processing"))
-    end
+    ensure_not_expired(ctx)
 
     return next(ctx, request)
 end

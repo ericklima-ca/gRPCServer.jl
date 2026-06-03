@@ -227,6 +227,28 @@ function remaining_time(ctx::ServerContext)::Union{Float64, Nothing}
 end
 
 """
+    is_expired(ctx::ServerContext) -> Bool
+
+Check whether the request deadline has expired.
+"""
+function is_expired(ctx::ServerContext)::Bool
+    remaining = remaining_time(ctx)
+    return remaining !== nothing && remaining <= 0
+end
+
+"""
+    ensure_not_expired(ctx::ServerContext)
+
+Throw `DEADLINE_EXCEEDED` if the request deadline has expired.
+"""
+function ensure_not_expired(ctx::ServerContext)
+    if is_expired(ctx)
+        throw(GRPCError(StatusCode.DEADLINE_EXCEEDED, "Request deadline exceeded"))
+    end
+    return nothing
+end
+
+"""
     is_cancelled(ctx::ServerContext) -> Bool
 
 Check if the request has been cancelled by the client.

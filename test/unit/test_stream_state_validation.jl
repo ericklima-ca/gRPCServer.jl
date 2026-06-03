@@ -3,6 +3,7 @@
 
 using Test
 using gRPCServer
+using Sockets
 
 @testset "Stream State Validation Tests" begin
     @testset "can_send function behavior" begin
@@ -115,6 +116,69 @@ using gRPCServer
         gRPCServer.send_headers!(stream, true)
         @test stream.state == gRPCServer.StreamState.CLOSED
         @test gRPCServer.can_send(stream) == false
+    end
+
+    @testset "Unary RPC waits for client END_STREAM before dispatch" begin
+        request_count = Ref(0)
+
+        function unary_waits_handler(ctx, request)
+            request_count[] += 1
+            return Vector{UInt8}("response")
+        end
+
+        server = gRPCServer.GRPCServer("127.0.0.1", 50051)
+        descriptor = gRPCServer.ServiceDescriptor(
+            "test.StreamState",
+            Dict(
+                "Unary" => gRPCServer.MethodDescriptor(
+                    "Unary",
+                    gRPCServer.MethodType.UNARY,
+                    "test.RawRequest",
+                    "test.RawResponse",
+                    unary_waits_handler
+                )
+            ),
+            nothing
+        )
+        gRPCServer.register_service!(server.dispatcher, descriptor)
+
+        conn = gRPCServer.HTTP2Connection()
+        conn.state = gRPCServer.ConnectionState.OPEN
+        io = IOBuffer()
+        peer = gRPCServer.PeerInfo(IPv4("127.0.0.1"), 50000)
+
+        stream = gRPCServer.create_stream(conn, UInt32(1))
+        stream.request_headers = [
+            (":method", "POST"),
+            (":path", "/test.StreamState/Unary"),
+            (":scheme", "http"),
+            (":authority", "localhost"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ]
+        stream.headers_complete = true
+        stream.state = gRPCServer.StreamState.OPEN
+        write(stream.data_buffer, gRPCServer.encode_grpc_message(Vector{UInt8}("request")))
+
+        @test gRPCServer.has_complete_grpc_message(stream)
+        @test !stream.end_stream_received
+
+        gRPCServer.process_completed_streams!(server, conn, io, peer)
+        @test request_count[] == 0
+        @test position(io) == 0
+        @test gRPCServer.get_stream(conn, UInt32(1)) !== nothing
+
+        gRPCServer.receive_data!(stream, UInt8[], true)
+
+        @test_logs (:warn, r"Unknown protobuf type") gRPCServer.process_completed_streams!(server, conn, io, peer)
+        @test request_count[] == 1
+        @test position(io) > 0
+        @test gRPCServer.get_stream(conn, UInt32(1)) === nothing
+
+        pos_after_response = position(io)
+        gRPCServer.process_completed_streams!(server, conn, io, peer)
+        @test request_count[] == 1
+        @test position(io) == pos_after_response
     end
 
     @testset "send_grpc_response on closed stream" begin

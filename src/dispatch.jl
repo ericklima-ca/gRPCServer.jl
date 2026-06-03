@@ -70,25 +70,106 @@ end
     _type_to_proto_name(T::Type) -> String
 
 Convert a Julia type to its protobuf fully-qualified name.
-Uses the module hierarchy to construct the name.
+
+Resolution order:
+- an existing type-registry entry;
+- a user/package-provided `proto_type_name(::Type{T})` method;
+- a conservative Julia module hierarchy fallback.
 """
 function _type_to_proto_name(T::Type)::String
-    # Get the module path
+    registered = registered_proto_type_name(T)
+    if registered !== nothing
+        return registered
+    end
+
+    declared = proto_type_name(T)
+    if declared !== nothing
+        return declared
+    end
+
+    return inferred_proto_type_name(T)
+end
+
+"""
+    proto_type_name(::Type{T}) -> Union{String, Nothing}
+
+Return the protobuf fully-qualified type name for `T`, or `nothing` if it is
+not known.
+
+Packages with generated protobuf types can overload this method to avoid
+heuristic name inference:
+
+```julia
+gRPCServer.proto_type_name(::Type{MyRequest}) = "my.package.MyRequest"
+```
+"""
+proto_type_name(::Type)::Union{String, Nothing} = nothing
+
+function registered_proto_type_name(T::Type)::Union{String, Nothing}
+    for (type_name, julia_type) in get_type_registry()
+        if julia_type === T
+            return type_name
+        end
+    end
+    return nothing
+end
+
+"""
+    register_proto_type!(type_name::String, T::Type)
+
+Register a protobuf fully-qualified type name for a Julia type.
+"""
+function register_proto_type!(type_name::String, T::Type)
+    if isempty(strip(type_name))
+        throw(ArgumentError("type_name must not be empty"))
+    end
+    get_type_registry()[type_name] = T
+    return T
+end
+
+function inferred_proto_type_name(T::Type)::String
     mod = parentmodule(T)
     type_name = string(nameof(T))
 
-    # Build package name from module hierarchy
-    parts = String[]
-    while mod !== Main && mod !== Base && mod !== Core
-        pushfirst!(parts, string(nameof(mod)))
-        mod = parentmodule(mod)
-    end
+    parts = proto_module_parts(mod)
 
     if isempty(parts)
         return type_name
     else
         return join(parts, ".") * "." * type_name
     end
+end
+
+function proto_module_parts(mod::Module)::Vector{String}
+    parts = String[]
+    seen = Set{Module}()
+    while !is_proto_name_root_module(mod) && !(mod in seen)
+        push!(seen, mod)
+        name = string(nameof(mod))
+        pushfirst!(parts, name)
+
+        next_mod = parentmodule(mod)
+        if next_mod === mod
+            break
+        end
+        mod = next_mod
+    end
+
+    generated_index = findlast(==("generated"), parts)
+    if generated_index !== nothing
+        parts = parts[(generated_index + 1):end]
+    end
+
+    filter!(name -> !is_proto_name_infrastructure_module(name), parts)
+    return parts
+end
+
+function is_proto_name_root_module(mod::Module)::Bool
+    return mod === Main || mod === Base || mod === Core || mod === gRPCServer
+end
+
+function is_proto_name_infrastructure_module(name::String)::Bool
+    return name in ("generated", "proto")
 end
 
 function Base.show(io::IO, method::MethodDescriptor)

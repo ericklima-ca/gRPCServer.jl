@@ -15,6 +15,9 @@ using gRPCServer
 
         # Timeouts
         @test config.keepalive_timeout == 20.0
+        @test config.permit_keepalive_time == 300.0
+        @test config.permit_keepalive_without_calls == false
+        @test config.max_ping_strikes == 2
         @test config.drain_timeout == 30.0
 
         # TLS
@@ -34,6 +37,9 @@ using gRPCServer
         config = ServerConfig(
             max_concurrent_streams = 500,
             max_message_size = 16 * 1024 * 1024,
+            permit_keepalive_time = 120.0,
+            permit_keepalive_without_calls = true,
+            max_ping_strikes = 1,
             drain_timeout = 60.0,
             enable_health_check = true,
             enable_reflection = true,
@@ -42,10 +48,18 @@ using gRPCServer
 
         @test config.max_concurrent_streams == 500
         @test config.max_message_size == 16 * 1024 * 1024
+        @test config.permit_keepalive_time == 120.0
+        @test config.permit_keepalive_without_calls == true
+        @test config.max_ping_strikes == 1
         @test config.drain_timeout == 60.0
         @test config.enable_health_check == true
         @test config.enable_reflection == true
         @test config.debug_mode == true
+    end
+
+    @testset "ServerConfig keepalive validation" begin
+        @test_throws ArgumentError ServerConfig(permit_keepalive_time=0.0)
+        @test_throws ArgumentError ServerConfig(max_ping_strikes=-1)
     end
 
     @testset "ServerConfig Show Method" begin

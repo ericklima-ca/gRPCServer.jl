@@ -115,6 +115,9 @@ Configuration container for gRPC server options.
 ## Timeouts (in seconds)
 - `keepalive_interval::Union{Float64, Nothing}`: Interval for keepalive pings (nothing = disabled)
 - `keepalive_timeout::Float64`: Timeout for keepalive response (default: 20.0)
+- `permit_keepalive_time::Float64`: Minimum allowed interval between client PINGs (default: 300.0)
+- `permit_keepalive_without_calls::Bool`: Allow client PINGs when no streams are active (default: false)
+- `max_ping_strikes::Int`: Client keepalive policy violations allowed before GOAWAY (default: 2)
 - `idle_timeout::Union{Float64, Nothing}`: Close idle connections after this time (nothing = never)
 - `drain_timeout::Float64`: Maximum time to wait for graceful shutdown (default: 30.0)
 
@@ -155,6 +158,9 @@ struct ServerConfig
     # Timeouts (in seconds)
     keepalive_interval::Union{Float64, Nothing}
     keepalive_timeout::Float64
+    permit_keepalive_time::Float64
+    permit_keepalive_without_calls::Bool
+    max_ping_strikes::Int
     idle_timeout::Union{Float64, Nothing}
     drain_timeout::Float64
 
@@ -180,6 +186,9 @@ struct ServerConfig
         max_message_size::Int=4 * 1024 * 1024,  # 4MB
         keepalive_interval::Union{Float64, Nothing}=nothing,
         keepalive_timeout::Float64=20.0,
+        permit_keepalive_time::Float64=300.0,
+        permit_keepalive_without_calls::Bool=false,
+        max_ping_strikes::Int=2,
         idle_timeout::Union{Float64, Nothing}=nothing,
         drain_timeout::Float64=30.0,
         tls::Union{TLSConfig, Nothing}=nothing,
@@ -205,6 +214,12 @@ struct ServerConfig
         if keepalive_timeout <= 0
             throw(ArgumentError("keepalive_timeout must be positive"))
         end
+        if permit_keepalive_time <= 0
+            throw(ArgumentError("permit_keepalive_time must be positive"))
+        end
+        if max_ping_strikes < 0
+            throw(ArgumentError("max_ping_strikes must be non-negative"))
+        end
         if drain_timeout <= 0
             throw(ArgumentError("drain_timeout must be positive"))
         end
@@ -220,6 +235,9 @@ struct ServerConfig
             max_message_size,
             keepalive_interval,
             keepalive_timeout,
+            permit_keepalive_time,
+            permit_keepalive_without_calls,
+            max_ping_strikes,
             idle_timeout,
             drain_timeout,
             tls,

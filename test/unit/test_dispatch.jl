@@ -3,6 +3,23 @@
 using Test
 using gRPCServer
 
+module ProtoNameFixtures
+    struct ExplicitRequest end
+
+    module generated
+        module acme
+            module inventory
+                module v1
+                    struct GeneratedRequest end
+                end
+            end
+        end
+    end
+end
+
+gRPCServer.proto_type_name(::Type{ProtoNameFixtures.ExplicitRequest}) =
+    "custom.package.ExplicitRequest"
+
 @testset "Dispatch Unit Tests" begin
     @testset "MethodDescriptor" begin
         handler = (ctx, req) -> "response"
@@ -23,6 +40,35 @@ using gRPCServer
         str = sprint(show, method)
         @test occursin("MethodDescriptor", str)
         @test occursin("TestMethod", str)
+    end
+
+    @testset "protobuf type name resolution" begin
+        @test gRPCServer._type_to_proto_name(gRPCServer.HealthCheckRequest) ==
+              "grpc.health.v1.HealthCheckRequest"
+        @test gRPCServer._type_to_proto_name(gRPCServer.ServerReflectionRequest) ==
+              "grpc.reflection.v1alpha.ServerReflectionRequest"
+
+        @test gRPCServer._type_to_proto_name(ProtoNameFixtures.ExplicitRequest) ==
+              "custom.package.ExplicitRequest"
+
+        generated_type = ProtoNameFixtures.generated.acme.inventory.v1.GeneratedRequest
+        @test gRPCServer._type_to_proto_name(generated_type) ==
+              "acme.inventory.v1.GeneratedRequest"
+
+        struct RegisteredRequest end
+        gRPCServer.register_proto_type!("registry.package.RegisteredRequest", RegisteredRequest)
+        @test gRPCServer._type_to_proto_name(RegisteredRequest) ==
+              "registry.package.RegisteredRequest"
+
+        method = MethodDescriptor(
+            "Registered",
+            MethodType.UNARY,
+            RegisteredRequest,
+            ProtoNameFixtures.ExplicitRequest,
+            (ctx, req) -> nothing
+        )
+        @test method.input_type == "registry.package.RegisteredRequest"
+        @test method.output_type == "custom.package.ExplicitRequest"
     end
 
     @testset "ServiceDescriptor" begin

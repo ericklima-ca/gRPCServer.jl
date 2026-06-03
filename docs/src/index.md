@@ -16,6 +16,7 @@ gRPCServer.jl provides a complete gRPC server implementation in Julia, enabling 
 - **TLS Support**: Secure connections with TLS and mutual TLS (mTLS)
 - **Pluggable HTTP/2 Backend**: HTTP/2 protocol delegated to [PureHTTP2.jl](https://github.com/s-celles/PureHTTP2.jl); custom backends can be plugged in via `AbstractHTTP2Backend` (see [HTTP/2 Backends](@ref))
 - **Reflection**: gRPC reflection service for tooling integration
+- **Operational Controls**: Deadline enforcement and optional conservative HTTP/2 keepalive
 
 ## Installation
 

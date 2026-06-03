@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `proto_type_name(::Type)` and `register_proto_type!` hooks for declaring
+  exact protobuf type names when generated Julia module paths do not map cleanly
+  to `.proto` package names.
+- `is_expired(ctx)` and `ensure_not_expired(ctx)` helpers for checking request
+  deadlines from handlers and interceptors.
+- Optional HTTP/2 server keepalive support using PING frames, controlled by
+  `keepalive_interval` and `keepalive_timeout`, plus inbound client keepalive
+  enforcement via `permit_keepalive_time`, `permit_keepalive_without_calls`,
+  and `max_ping_strikes`.
 - Pluggable HTTP/2 backend architecture via `AbstractHTTP2Backend` abstract type
   and `PureHTTP2Backend` default implementation. The `GRPCServer` constructor
   accepts an `http2_backend` keyword argument to select a backend at construction
@@ -38,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independent client stacks
 
 ### Changed
+- Unary and server-streaming RPC dispatch now waits for client `END_STREAM`
+  before invoking handlers, avoiding duplicate processing when DATA arrives
+  before the request stream is closed.
+- Deadline enforcement now rejects expired requests before handler dispatch with
+  `DEADLINE_EXCEEDED`, and streaming callbacks treat expired contexts as
+  cancelled.
+- Protobuf type-name inference now prefers the explicit registry, then
+  user-provided `proto_type_name` methods, then a generated-module-aware
+  fallback.
 - Documentation build now runs in strict mode (removed `warnonly` from `docs/make.jl`)
 - Updated `devbranch` to `develop` in `docs/make.jl` for Git flow compatibility
 - TLS backend switched from OpenSSL.jl to Reseau.jl. `Reseau` is now a

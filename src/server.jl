@@ -74,6 +74,9 @@ mutable struct GRPCServer
         max_queued_requests::Int=1000,
         keepalive_interval::Union{Float64, Nothing}=nothing,
         keepalive_timeout::Float64=20.0,
+        permit_keepalive_time::Float64=300.0,
+        permit_keepalive_without_calls::Bool=false,
+        max_ping_strikes::Int=2,
         idle_timeout::Union{Float64, Nothing}=nothing,
         drain_timeout::Float64=30.0,
         tls::Union{TLSConfig, Nothing}=nothing,
@@ -103,6 +106,9 @@ mutable struct GRPCServer
             max_message_size=max_message_size,
             keepalive_interval=keepalive_interval,
             keepalive_timeout=keepalive_timeout,
+            permit_keepalive_time=permit_keepalive_time,
+            permit_keepalive_without_calls=permit_keepalive_without_calls,
+            max_ping_strikes=max_ping_strikes,
             idle_timeout=idle_timeout,
             drain_timeout=drain_timeout,
             tls=tls,
@@ -564,6 +570,8 @@ function handle_connection(server::GRPCServer, client)
 
         # Create HTTP/2 connection manager via backend
         conn = create_connection(server.http2_backend)
+        keepalive_state = KeepaliveState()
+        client_keepalive_state = ClientKeepaliveState()
 
         # Read and validate client connection preface
         preface_data = read_connection_preface(client)
@@ -588,6 +596,8 @@ function handle_connection(server::GRPCServer, client)
 
         @debug "Server SETTINGS sent, starting frame processing loop"
 
+        keepalive_task = start_keepalive_loop(server, conn, client, keepalive_state)
+
         # Main frame processing loop
         while isopen(client) && is_open(conn) && server.status == ServerStatus.RUNNING
             @debug "Waiting for next frame..."
@@ -599,6 +609,19 @@ function handle_connection(server::GRPCServer, client)
             end
 
             @debug "Received frame" type=frame.header.frame_type stream_id=frame.header.stream_id length=frame.header.length flags=frame.header.flags
+            process_keepalive_ack!(keepalive_state, frame)
+            if should_close_for_client_keepalive!(
+                client_keepalive_state, server.config, conn, frame
+            )
+                @warn "Client sent too many keepalive PINGs, closing connection"
+                goaway = send_goaway(
+                    conn,
+                    ErrorCode.ENHANCE_YOUR_CALM,
+                    Vector{UInt8}("too_many_pings"),
+                )
+                write_frame(client, goaway)
+                break
+            end
 
             try
                 # Process frame and get response frames
@@ -641,6 +664,15 @@ function handle_connection(server::GRPCServer, client)
             @error "Connection error" exception=(e, catch_backtrace())
         end
     finally
+        if @isdefined(keepalive_task) && keepalive_task !== nothing
+            try
+                if !istaskdone(keepalive_task)
+                    schedule(keepalive_task, InterruptException(); error=true)
+                end
+            catch
+            end
+        end
+
         try
             close(client)
         catch
@@ -745,6 +777,170 @@ function write_frames(io::IO, frames::Vector{Frame})
     flush(io)
 end
 
+mutable struct KeepaliveState
+    pending_payload::Union{Vector{UInt8}, Nothing}
+    sent_at::Float64
+    lock::ReentrantLock
+
+    KeepaliveState() = new(nothing, 0.0, ReentrantLock())
+end
+
+mutable struct ClientKeepaliveState
+    last_ping_at::Union{Float64, Nothing}
+    ping_strikes::Int
+    lock::ReentrantLock
+
+    ClientKeepaliveState() = new(nothing, 0, ReentrantLock())
+end
+
+function make_keepalive_payload()::Vector{UInt8}
+    value = UInt64(time_ns())
+    return UInt8[
+        (value >> 56) & 0xff,
+        (value >> 48) & 0xff,
+        (value >> 40) & 0xff,
+        (value >> 32) & 0xff,
+        (value >> 24) & 0xff,
+        (value >> 16) & 0xff,
+        (value >> 8) & 0xff,
+        value & 0xff,
+    ]
+end
+
+function keepalive_pending(state::KeepaliveState)::Bool
+    lock(state.lock) do
+        return state.pending_payload !== nothing
+    end
+end
+
+function keepalive_timed_out(state::KeepaliveState, timeout::Float64; now::Float64=time())::Bool
+    lock(state.lock) do
+        return state.pending_payload !== nothing && now - state.sent_at >= timeout
+    end
+end
+
+function mark_keepalive_sent!(state::KeepaliveState, payload::Vector{UInt8}; now::Float64=time())
+    lock(state.lock) do
+        state.pending_payload = copy(payload)
+        state.sent_at = now
+    end
+    return nothing
+end
+
+function process_keepalive_ack!(state::KeepaliveState, frame::Frame)::Bool
+    if frame.header.frame_type != FrameType.PING || !has_flag(frame.header, FrameFlags.ACK)
+        return false
+    end
+
+    return lock(state.lock) do
+        if state.pending_payload !== nothing && frame.payload == state.pending_payload
+            state.pending_payload = nothing
+            state.sent_at = 0.0
+            true
+        else
+            false
+        end
+    end
+end
+
+function is_client_keepalive_ping(frame::Frame)::Bool
+    return frame.header.frame_type == FrameType.PING &&
+           !has_flag(frame.header, FrameFlags.ACK)
+end
+
+function has_active_streams(conn::HTTP2Connection)::Bool
+    return active_stream_count(conn) > 0
+end
+
+function client_keepalive_violation(
+    config::ServerConfig,
+    conn::HTTP2Connection,
+    last_ping_at::Union{Float64, Nothing};
+    now::Float64=time(),
+)::Bool
+    if !config.permit_keepalive_without_calls && !has_active_streams(conn)
+        return true
+    end
+
+    if last_ping_at !== nothing &&
+       now - last_ping_at < config.permit_keepalive_time
+        return true
+    end
+
+    return false
+end
+
+function record_client_keepalive_ping!(
+    state::ClientKeepaliveState,
+    config::ServerConfig,
+    conn::HTTP2Connection;
+    now::Float64=time(),
+)::Bool
+    return lock(state.lock) do
+        violation = client_keepalive_violation(
+            config, conn, state.last_ping_at; now=now
+        )
+        state.last_ping_at = now
+
+        if violation
+            state.ping_strikes += 1
+        else
+            state.ping_strikes = 0
+        end
+
+        return state.ping_strikes > config.max_ping_strikes
+    end
+end
+
+function should_close_for_client_keepalive!(
+    state::ClientKeepaliveState,
+    config::ServerConfig,
+    conn::HTTP2Connection,
+    frame::Frame;
+    now::Float64=time(),
+)::Bool
+    if !is_client_keepalive_ping(frame)
+        return false
+    end
+
+    return record_client_keepalive_ping!(state, config, conn; now=now)
+end
+
+function start_keepalive_loop(server::GRPCServer, conn::HTTP2Connection, io::IO, state::KeepaliveState)
+    interval = server.config.keepalive_interval
+    if interval === nothing
+        return nothing
+    end
+
+    return @async begin
+        try
+            while server.status == ServerStatus.RUNNING && is_open(conn) && isopen(io)
+                sleep(interval)
+
+                if keepalive_timed_out(state, server.config.keepalive_timeout)
+                    @warn "HTTP/2 keepalive timeout, closing connection" timeout=server.config.keepalive_timeout
+                    goaway = send_goaway(conn, ErrorCode.NO_ERROR, Vector{UInt8}("keepalive timeout"))
+                    write_frame(io, goaway)
+                    close(io)
+                    break
+                end
+
+                if keepalive_pending(state)
+                    continue
+                end
+
+                payload = make_keepalive_payload()
+                mark_keepalive_sent!(state, payload)
+                write_frame(io, ping_frame(payload))
+            end
+        catch e
+            if !(e isa InterruptException) && server.status == ServerStatus.RUNNING
+                @debug "HTTP/2 keepalive loop stopped" exception=e
+            end
+        end
+    end
+end
+
 """
     process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
                                io::IO, peer::PeerInfo)
@@ -760,11 +956,8 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
 
     lock(conn.lock) do
         for (stream_id, stream) in conn.streams
-            if stream.headers_complete && !stream.reset
-                # Check if we have a complete gRPC message to process
-                if stream.end_stream_received || has_complete_grpc_message(stream)
-                    push!(streams_to_process, stream_id)
-                end
+            if should_process_stream_now(server, stream)
+                push!(streams_to_process, stream_id)
             end
         end
     end
@@ -796,6 +989,44 @@ function process_completed_streams!(server::GRPCServer, conn::HTTP2Connection,
             remove_stream(conn, stream_id)
         end
     end
+end
+
+"""
+    should_process_stream_now(server::GRPCServer, stream::HTTP2Stream) -> Bool
+
+Return true when the request stream has enough data for dispatch.
+
+Unary, server-streaming, client-streaming, and user bidirectional RPCs are
+dispatched after the client half-closes the request stream. This prevents a
+unary request from being handled twice when the DATA frame carrying a complete
+gRPC message arrives before the HTTP/2 END_STREAM flag.
+
+The built-in reflection service is the only incremental bidirectional handler:
+it may process each complete message before END_STREAM so grpcurl/reflection
+clients receive prompt responses on a long-lived stream.
+"""
+function should_process_stream_now(server::GRPCServer, stream::HTTP2Stream)::Bool
+    if !stream.headers_complete || stream.reset
+        return false
+    end
+
+    method_path = get_path(stream)
+    if method_path === nothing
+        return stream.end_stream_received
+    end
+
+    result = lookup_method(server.dispatcher.registry, method_path)
+    if result === nothing
+        return stream.end_stream_received
+    end
+
+    service, method_desc = result
+    if method_desc.method_type == MethodType.BIDI_STREAMING &&
+       service.name == "grpc.reflection.v1alpha.ServerReflection"
+        return stream.end_stream_received || has_complete_grpc_message(stream)
+    end
+
+    return stream.end_stream_received
 end
 
 """
@@ -957,6 +1188,12 @@ function process_stream_request!(server::GRPCServer, conn::HTTP2Connection,
     # Create server context
     ctx = create_server_context(stream, peer, method_path)
 
+    if is_expired(ctx)
+        cancel!(ctx)
+        send_error_response(conn, io, stream.id, StatusCode.DEADLINE_EXCEEDED, "Request deadline exceeded"; content_type=response_content_type)
+        return
+    end
+
     # Log request if enabled
     if server.config.log_requests
         @info "gRPC request" method=method_path peer=peer
@@ -1033,6 +1270,7 @@ function handle_server_streaming(
 
         # Create send callback for the ServerStream
         send_callback = function(message, compress)
+            ensure_not_expired(ctx)
             response_data = serialize_message(message)
             grpc_message = encode_grpc_message(response_data; compressed=false)
             data_frames = send_data(conn, stream.id, grpc_message; end_stream=false)
@@ -1226,7 +1464,7 @@ function handle_client_streaming(
 
         # Create is_cancelled callback
         is_cancelled_callback = function()
-            return ctx.cancelled || stream.state == StreamState.CLOSED
+            return ctx.cancelled || is_expired(ctx) || stream.state == StreamState.CLOSED
         end
 
         # Call dispatcher which handles the handler execution
@@ -1403,6 +1641,7 @@ function handle_bidi_streaming(
 
         # Create send callback for responses
         send_callback = function(message, _compress)
+            ensure_not_expired(ctx)
             if trailers_sent[]
                 @warn "Attempted to send message after stream closed" stream_id=stream.id
                 return
@@ -1431,7 +1670,7 @@ function handle_bidi_streaming(
 
         # Create is_cancelled callback
         is_cancelled_callback = function()
-            return ctx.cancelled || stream.state == StreamState.CLOSED
+            return ctx.cancelled || is_expired(ctx) || stream.state == StreamState.CLOSED
         end
 
         # Call dispatcher which handles the handler execution

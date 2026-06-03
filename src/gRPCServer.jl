@@ -112,6 +112,7 @@ export start!, stop!
 
 # Service Registration
 export register!, services, service_descriptor
+export proto_type_name, register_proto_type!
 
 # Interceptors
 export add_interceptor!
@@ -127,7 +128,7 @@ export send!, close!
 
 # Context Operations
 export set_header!, set_trailer!, get_metadata, get_metadata_string, get_metadata_binary
-export remaining_time, is_cancelled
+export remaining_time, is_expired, ensure_not_expired, is_cancelled
 
 # Compression functions
 export compress, decompress, codec_name, parse_codec, negotiate_compression
